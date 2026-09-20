@@ -1,55 +1,81 @@
 # Failure Modes
 
-This document describes the real failures this design exists to prevent. Each entry names the symptom, the root cause, and the guard that stops it from happening again.
+Seven real failures from a production AI agent system. Each is written as a short case: what was observed, what caused it, and what now prevents it.
 
-## Dry-run checkpoint persistence
+---
 
-**Symptom:** A dry-run that was supposed to be read-only recorded its checkpoint anyway. On the first real run, the system found nothing left to process and wrote zero new facts to storage.
+## 1. A dry-run that persisted its checkpoint
 
-**Cause:** The state-save routine did not check the dry-run flag before persisting the checkpoint. It treated the dry-run iteration as authoritative progress and advanced the cursor past all work.
+**Symptom.** A dry-run completed without writing any output records, which was expected. The following real run also wrote zero records and reported success.
 
-**Guard:** The state-save method accepts the dry-run flag as an argument and returns early without mutation if the flag is set. Real runs pass `dry_run=False`; the method inspects this before writing to the checkpoint file.
+**Cause.** The state-save function recorded every processed item into the checkpoint store regardless of the dry-run flag. The first real run consulted the checkpoint, found every item already marked as seen, and had nothing left to do.
 
-## Cheap model hallucinating structured data
+**Guard.** The state-save function now accepts the dry-run flag and returns early without writing when it is set. A test exercises a dry-run followed immediately by a real run and asserts that the real run produces output.
 
-**Symptom:** A cost-reduction effort switched to a cheaper language model for fact extraction. The model fabricated every repository name, star count, and date in its output. The downstream evaluator passed all rows because they had the correct JSON shape.
+---
 
-**Cause:** Shape-based validation checks only that a row is a dictionary with the right keys. It does not verify that the values are real. The cheaper model was confidently wrong, and the evaluator had no way to tell.
+## 2. A cheap model fabricating structured data
 
-**Guard:** Facts are verified out of band against a trusted source before they enter the system. Verified data is frozen into a static file and shipped with the code rather than re-fetched on every run. The evaluator checks both shape and membership in this frozen set.
+**Symptom.** A pipeline stage asked a small model to produce a table of open-source projects with repository names, star counts, and last-updated dates. The output looked correct: right columns, plausible values, no obvious errors.
 
-## Rate-limit exhaustion from per-item API calls
+**Cause.** The model invented every row. An automated evaluator checked column names and value types and passed the result, because the output had the right shape. None of the repositories existed.
 
-**Symptom:** Every run made one API call per item to fetch fresh metadata. On a production corpus with tens of thousands of items, this exhausted the service rate limit within hours. Subsequent calls returned "unknown" for every row until the quota reset.
+**Guard.** Facts of this kind are now verified out of band once and written to a static file that the job reads on subsequent runs. The model is not asked to re-derive them each time.
 
-**Cause:** The system re-fetched metadata on every run without caching. Each item was treated as if it could change between runs, so no data was reused.
+---
 
-**Guard:** Same as the fabrication guard above. Static, verified data is the source of truth. The system does not call the upstream API on every run; it only reconciles changes against the frozen baseline. This reduces call volume by orders of magnitude and eliminates rate-limit risk.
+## 3. Rate-limit exhaustion masking as success
 
-## Secret-detection regex missing trailing tokens
+**Symptom.** Every row in the output carried an "unknown" value for a particular field. The job reported success and no error was logged.
 
-**Symptom:** A regex designed to detect authentication tokens in logs missed a token that appeared at the end of a sentence, followed by a period. The period was preserved in the output, leaking the token.
+**Cause.** The pipeline made one external API call per row on every run. An hourly quota was exhausted early in each run; the remaining calls returned rate-limit errors that the code silently converted to the sentinel value "unknown."
 
-**Cause:** The regex used a lookahead assertion `(?!\w)` to ensure a token did not have a word character after it. A period is not a word character, so the lookahead succeeded, and the token was matched and then not redacted.
+**Guard.** The same static file introduced for failure 2 eliminated the per-row API calls entirely. One file read replaces N network calls, and there is no quota to exhaust.
 
-**Guard:** The lookahead is tightened to exclude only word characters (`(?!\w)` is correct), and a test case is added that places the secret in final position before punctuation. The test runs on every build.
+---
 
-## Silent truncation of staged context
+## 4. A secret-detection regex that missed a token at a sentence boundary
 
-**Symptom:** A model was asked to quote from context that had been silently truncated. It quoted across the gap as though the text were contiguous, producing nonsense that referenced both sides of a large omitted section.
+**Symptom.** A secret token appearing at the end of a sentence passed the detection check undetected. The same token mid-sentence was caught correctly.
 
-**Cause:** Context files were truncated to fit memory budgets, but no marker was left to signal the gap. The model could not distinguish between "no gap" and "gap so large that the missing text is unknown."
+**Cause.** The regex ended with a negative lookahead that excluded any following character that was either a word character or a period. A token followed by a full stop did not match because the lookahead rejected the period.
 
-**Guard:** Truncation always includes an explicit marker naming the byte count and line range of the dropped section. Quoting across a marked gap is forbidden by the prompt; the model is instructed to refuse to quote text that crosses the marker.
+**Guard.** The lookahead now excludes word characters only, leaving punctuation outside its scope. The test suite has an explicit case with the secret token in final position, followed by a period.
 
-## Model-written memory treated as fact
+---
 
-**Symptom:** A model generated a memory artifact as part of its reasoning. The system persisted this artifact into the memory store as if it were a verified fact. Subsequent runs retrieved and acted on the fabricated memory.
+## 5. Silent truncation of staged context
 
-**Cause:** There was no quarantine step between model generation and persistence. Anything the model wrote was assumed to be authoritative.
+**Symptom.** A model produced a confident quotation from a document that did not contain it. The quoted passage spanned a section that had been truncated to fit a context limit.
 
-**Guard:** A quarantine stage exists between generation and storage. Memory artifacts are marked as unverified, and a separate process reviews them before they are committed to the durable store. The model is not permitted to write directly to memory; it can only propose changes that a separate verification step accepts or rejects.
+**Cause.** Oversized files were cut at a character limit with no marker at the cut point. The model received a contiguous-looking block of text, inferred that it was complete, and quoted freely across the gap.
+
+**Guard.** Truncation now inserts an explicit marker stating how many characters were dropped and instructing the model not to quote across it. The system prompt reinforces this.
+
+---
+
+## 6. Model-written memory treated as established fact
+
+**Symptom.** A claim introduced by one agent appeared in the outputs of several later agents as a cited fact. The original claim was incorrect.
+
+**Cause.** Anything a model writes to shared memory is readable by every subsequent agent with no indication of its provenance. Later agents read it, cited it, and built further inferences on it.
+
+**Guard.** Model output now enters memory at a low-confidence tier with a tag indicating its source. It is not treated as established fact until a human explicitly promotes it.
+
+---
+
+## 7. An evaluator scoring form rather than substance
+
+**Symptom.** A pipeline stage passed its automated quality check twice. Inspection showed the model had re-summarised its own input rather than performing the assigned task.
+
+**Cause.** The evaluator was a local model that checked whether the output was on-topic and well-formed. The output was both. It did not check whether the task had been done.
+
+**Guard.** Cheap automated checks are now used only to gate cheap things. Any step that is expensive to undo — or where a plausible-looking wrong answer is worse than no answer — requires either a substance check or a human review before the result is used downstream.
+
+---
 
 ## General lesson
 
-An automated evaluator that checks only shape will eventually approve confident nonsense at scale. When the stakes of approval are high—especially for things that are expensive to undo—the expensive checks belong on substance, not form. Verify facts out of band, freeze them into static files, and use those files as the source of truth rather than re-computing or re-fetching on each run. This trades one-time verification cost (potentially large) for unlimited confidence in every subsequent use.
+An automated evaluator that checks shape will eventually approve confident nonsense. The cost of that approval is proportional to how hard the mistake is to reverse: a wrong shape is caught immediately, a wrong fact can propagate for months. Put expensive checks where mistakes are expensive.
+
+It is worth noting that the author of this document also verified a generated file by its line count and shipped an empty one. The failure mode is not specific to machines.
