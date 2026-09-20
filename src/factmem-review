@@ -1,0 +1,307 @@
+#!/bin/sh
+# factmem-review - Triage proposed facts in factmem.
+#
+# Usage:
+#   factmem-review list
+#   factmem-review promote <id>
+#   factmem-review reject <id> [reason]
+#   factmem-review purge-proposed [days]
+#
+# Reads bearer token from /etc/factmem-client.env (mode 0600 header file).
+
+set -e
+
+# ── config ─────────────────────────────────────────────────────────────────
+
+ENV_FILE="/etc/factmem-client.env"
+HEADER_FILE=""
+
+# ── cleanup ────────────────────────────────────────────────────────────────
+
+cleanup() {
+	if [ -n "$HEADER_FILE" ] && [ -f "$HEADER_FILE" ]; then
+		rm -f "$HEADER_FILE"
+	fi
+}
+
+trap cleanup EXIT
+
+# ── load env ───────────────────────────────────────────────────────────────
+
+load_env() {
+	if [ ! -r "$ENV_FILE" ]; then
+		echo "Error: Cannot read $ENV_FILE" >&2
+		exit 1
+	fi
+
+	URL=$(grep "^FACTMEM_URL=" "$ENV_FILE" | cut -d= -f2- | sed 's/[[:space:]]*$//')
+	TOKEN=$(grep "^FACTMEM_TOKEN=" "$ENV_FILE" | cut -d= -f2- | sed 's/[[:space:]]*$//')
+
+	if [ -z "$URL" ] || [ -z "$TOKEN" ]; then
+		echo "Error: FACTMEM_URL and FACTMEM_TOKEN must be set in $ENV_FILE" >&2
+		exit 1
+	fi
+}
+
+# ── setup headers ──────────────────────────────────────────────────────────
+
+setup_headers() {
+	HEADER_FILE=$(mktemp) || exit 1
+	chmod 0600 "$HEADER_FILE"
+	echo "Authorization: Bearer $TOKEN" > "$HEADER_FILE"
+}
+
+# ── list proposed facts ────────────────────────────────────────────────────
+
+cmd_list() {
+	load_env
+	setup_headers
+
+	# GET /facts?tag=proposed&limit=100
+	RESP=$(curl -s -H @"$HEADER_FILE" \
+		"$URL/facts?tag=proposed&limit=100&include_expired=false")
+
+	if [ $? -ne 0 ]; then
+		echo "Error: Failed to fetch facts" >&2
+		exit 1
+	fi
+
+	# Parse and display facts (newest first)
+	echo "$RESP" | python3 -c '
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    facts = data.get("facts", [])
+    facts.sort(key=lambda f: f.get("created_at", ""), reverse=True)
+    for i, fact in enumerate(facts, 1):
+        fact_id = fact.get("id", "?")
+        text = fact.get("text", "")
+        confidence = fact.get("confidence", "?")
+        source = fact.get("source", "?")
+        created = fact.get("created_at", "?")
+        print(f"{i}. [{fact_id}] confidence={confidence} source={source} created={created}")
+        print(f"   {text[:100]}...")
+        print()
+except Exception as e:
+    print(f"Error parsing response: {e}", file=sys.stderr)
+    sys.exit(1)
+'
+}
+
+# ── promote fact (confidence 0.9, remove "proposed" tag) ────────────────────
+
+cmd_promote() {
+	FACT_ID="$1"
+	if [ -z "$FACT_ID" ]; then
+		echo "Usage: factmem-review promote <id>" >&2
+		exit 1
+	fi
+
+	load_env
+	setup_headers
+
+	# GET /facts/<id> to get current text and other fields
+	FACT=$(curl -s -H @"$HEADER_FILE" "$URL/facts/$FACT_ID")
+	if [ $? -ne 0 ]; then
+		echo "Error: Failed to fetch fact $FACT_ID" >&2
+		exit 1
+	fi
+
+	TEXT=$(echo "$FACT" | python3 -c 'import sys, json; print(json.load(sys.stdin).get("text", ""))')
+	SOURCE=$(echo "$FACT" | python3 -c 'import sys, json; print(json.load(sys.stdin).get("source", ""))')
+
+	if [ -z "$TEXT" ]; then
+		echo "Error: Could not extract text from fact" >&2
+		exit 1
+	fi
+
+	# Build JSON body with python3 (pass text via stdin)
+	BODY=$(printf '%s\n' "$TEXT" | python3 -c '
+import json, sys
+text = sys.stdin.read().strip()
+obj = {
+    "text": text,
+    "reason": "Promoted by operator",
+    "source": "factmem-review"
+}
+print(json.dumps(obj))
+')
+
+	# PUT /facts/<id> to supersede with confidence 0.9 and remove "proposed" tag
+	RESP=$(curl -s -X PUT -H @"$HEADER_FILE" \
+		-H "Content-Type: application/json" \
+		-d "$BODY" \
+		"$URL/facts/$FACT_ID")
+
+	if [ $? -ne 0 ]; then
+		echo "Error: Failed to promote fact" >&2
+		exit 1
+	fi
+
+	NEW_ID=$(echo "$RESP" | python3 -c 'import sys, json; print(json.load(sys.stdin).get("id", ""))')
+	if [ -n "$NEW_ID" ]; then
+		echo "Promoted $FACT_ID -> $NEW_ID (confidence 0.9)"
+	else
+		echo "Error: Could not extract new fact ID from response" >&2
+		exit 1
+	fi
+}
+
+# ── reject fact ────────────────────────────────────────────────────────────
+
+cmd_reject() {
+	FACT_ID="$1"
+	REASON="${2:-Rejected by operator}"
+
+	if [ -z "$FACT_ID" ]; then
+		echo "Usage: factmem-review reject <id> [reason]" >&2
+		exit 1
+	fi
+
+	load_env
+	setup_headers
+
+	# Build JSON body with python3 (pass reason via stdin)
+	BODY=$(printf '%s\n' "$REASON" | python3 -c '
+import sys, json
+reason = sys.stdin.read().strip()
+obj = {"reason": reason}
+print(json.dumps(obj))
+')
+
+	# DELETE /facts/<id>
+	curl -s -X DELETE -H @"$HEADER_FILE" \
+		-H "Content-Type: application/json" \
+		-d "$BODY" \
+		"$URL/facts/$FACT_ID" > /dev/null
+
+	if [ $? -eq 0 ]; then
+		echo "Rejected $FACT_ID: $REASON"
+	else
+		echo "Error: Failed to reject fact $FACT_ID" >&2
+		exit 1
+	fi
+}
+
+# ── purge proposed facts older than N days ─────────────────────────────────
+
+cmd_purge_proposed() {
+	DAYS="${1:-30}"
+
+	if ! echo "$DAYS" | grep -qE '^[0-9]+$'; then
+		echo "Error: DAYS must be a number" >&2
+		exit 1
+	fi
+
+	load_env
+	setup_headers
+
+	# GET /facts?tag=proposed
+	RESP=$(curl -s -H @"$HEADER_FILE" \
+		"$URL/facts?tag=proposed&limit=1000&include_expired=true")
+
+	if [ $? -ne 0 ]; then
+		echo "Error: Failed to fetch proposed facts" >&2
+		exit 1
+	fi
+
+	# Filter by age and show what will be deleted
+	PYTHON_SCRIPT=$(cat <<'PYTHON'
+import sys, json, datetime
+
+days = int(sys.argv[1])
+data = json.load(sys.stdin)
+facts = data.get("facts", [])
+
+# Parse ISO timestamp and compute cutoff
+now = datetime.datetime.fromisoformat(datetime.datetime.now(datetime.timezone.utc).isoformat())
+cutoff = (now - datetime.timedelta(days=days)).timestamp()
+
+to_delete = []
+for fact in facts:
+    created_str = fact.get("created_at", "")
+    if not created_str:
+        continue
+    try:
+        created = datetime.datetime.fromisoformat(created_str.replace("Z", "+00:00"))
+        if created.timestamp() < cutoff:
+            to_delete.append(fact)
+    except:
+        pass
+
+for fact in sorted(to_delete, key=lambda f: f.get("created_at", "")):
+    fact_id = fact.get("id", "?")
+    text = fact.get("text", "")[:60]
+    created = fact.get("created_at", "?")
+    print(f"  {fact_id} ({created}): {text}")
+
+print(f"\nWill delete {len(to_delete)} facts older than {days} days.")
+if to_delete:
+    response = input("\nContinue? (y/N): ")
+    if response.lower() == "y":
+        for fact in to_delete:
+            sys.stdout.write(json.dumps({"id": fact.get("id")}) + "\n")
+    else:
+        print("Cancelled.")
+        sys.exit(0)
+PYTHON
+)
+
+	echo "$RESP" | python3 -c "$PYTHON_SCRIPT" "$DAYS" | while read -r line; do
+		if echo "$line" | grep -qE '^\{'; then
+			# This is a JSON fact to delete
+			FACT_ID=$(echo "$line" | python3 -c 'import sys, json; print(json.load(sys.stdin).get("id"))')
+
+			# Build JSON body with python3 (pass days via stdin)
+			BODY=$(printf '%s\n' "$DAYS" | python3 -c '
+import sys, json
+days = sys.stdin.read().strip()
+obj = {"reason": f"Purged by operator (older than {days} days)"}
+print(json.dumps(obj))
+')
+
+			curl -s -X DELETE -H @"$HEADER_FILE" \
+				-H "Content-Type: application/json" \
+				-d "$BODY" \
+				"$URL/facts/$FACT_ID" > /dev/null
+
+			if [ $? -eq 0 ]; then
+				echo "Deleted $FACT_ID"
+			else
+				echo "Error deleting $FACT_ID" >&2
+			fi
+		else
+			# Regular output line (counts, prompts, etc.)
+			echo "$line"
+		fi
+	done
+}
+
+# ── main ───────────────────────────────────────────────────────────────────
+
+if [ $# -eq 0 ]; then
+	echo "Usage: factmem-review {list|promote|reject|purge-proposed} [args...]" >&2
+	exit 1
+fi
+
+CMD="$1"
+shift
+
+case "$CMD" in
+	list)
+		cmd_list "$@"
+		;;
+	promote)
+		cmd_promote "$@"
+		;;
+	reject)
+		cmd_reject "$@"
+		;;
+	purge-proposed)
+		cmd_purge_proposed "$@"
+		;;
+	*)
+		echo "Unknown command: $CMD" >&2
+		exit 1
+		;;
+esac
